@@ -203,18 +203,18 @@ export function downloadToCompletion(options: DownloadOptions): Promise<Download
 function toNativeOptions(options: NormalizedDownloadOptions): NativeDownloadOptions {
   return {
     url: options.url,
-    target_path: options.targetPath,
-    chunk_size: options.chunkSize,
+    targetPath: options.targetPath,
+    chunkSize: options.chunkSize,
     parallelism: options.parallelism,
-    max_parallel_chunks: options.maxParallelChunks,
-    max_io: options.maxIo,
-    max_retries: options.maxRetries,
-    backoff_initial_ms: options.backoffInitialMs,
-    backoff_max_ms: options.backoffMaxMs,
-    connect_timeout_ms: options.connectTimeoutMs,
-    read_timeout_ms: options.readTimeoutMs,
-    total_timeout_ms: options.totalTimeoutMs,
-    bytes_per_second_limit: options.bytesPerSecondLimit,
+    maxParallelChunks: options.maxParallelChunks,
+    maxIo: options.maxIo,
+    maxRetries: options.maxRetries,
+    backoffInitialMs: options.backoffInitialMs,
+    backoffMaxMs: options.backoffMaxMs,
+    connectTimeoutMs: options.connectTimeoutMs,
+    readTimeoutMs: options.readTimeoutMs,
+    totalTimeoutMs: options.totalTimeoutMs,
+    bytesPerSecondLimit: options.bytesPerSecondLimit,
     hash: options.hash,
     sha256: undefined
   }
@@ -223,26 +223,26 @@ function toNativeOptions(options: NormalizedDownloadOptions): NativeDownloadOpti
 function fromNativeSnapshot(snapshot: NativeDownloadSnapshot): NormalizedDownloadSnapshot {
   return {
     phase: snapshot.phase,
-    contentLen: snapshot.content_len,
-    downloadedBytes: snapshot.downloaded_bytes,
-    chunkSize: snapshot.chunk_size,
-    chunkCount: snapshot.chunk_count,
-    completedChunks: snapshot.completed_chunks,
-    activeIo: snapshot.active_io,
-    lastError: snapshot.last_error,
-    lastErrorCode: snapshot.last_error_code
+    contentLen: snapshot.contentLen,
+    downloadedBytes: snapshot.downloadedBytes,
+    chunkSize: snapshot.chunkSize,
+    chunkCount: snapshot.chunkCount,
+    completedChunks: snapshot.completedChunks,
+    activeIo: snapshot.activeIo,
+    lastError: snapshot.lastError,
+    lastErrorCode: snapshot.lastErrorCode
   }
 }
 
 function fromNativeSpeedSnapshot(snapshot: NativeDownloadSpeedSnapshot): NormalizedDownloadSpeedSnapshot {
   return {
     phase: snapshot.phase,
-    contentLen: snapshot.content_len,
-    receivedBytes: snapshot.received_bytes,
-    intervalBytes: snapshot.interval_bytes,
-    elapsedMillis: snapshot.elapsed_millis,
-    bytesPerSecond: snapshot.bytes_per_second,
-    activeIo: snapshot.active_io
+    contentLen: snapshot.contentLen,
+    receivedBytes: snapshot.receivedBytes,
+    intervalBytes: snapshot.intervalBytes,
+    elapsedMillis: snapshot.elapsedMillis,
+    bytesPerSecond: snapshot.bytesPerSecond,
+    activeIo: snapshot.activeIo
   }
 }
 

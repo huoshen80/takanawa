@@ -77,6 +77,33 @@ jobs:
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - run: mise run test:js
 
+  takanawa-node:
+    name: takanawa-node (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - windows-2022
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.6.6
+          experimental: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure macOS deployment target
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+      - run: mise run install:node
+      - run: pnpm --filter takanawa-node test
+      - name: Verify macOS minimum version
+        if: runner.os == 'macOS'
+        shell: bash
+        run: vtool -show-build packages/takanawa-node/takanawa.darwin-arm64.node | grep -E 'minos[[:space:]]+11\.0'
+
   android:
     name: Android checks
     runs-on: ubuntu-latest

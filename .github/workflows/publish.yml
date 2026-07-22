@@ -62,6 +62,9 @@ jobs:
       - name: Enable sccache for Rust builds
         shell: bash
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - run: mise run install:node
+      - name: Build and test Linux Node addon
+        run: pnpm --filter takanawa-node test
       - name: Build Linux dynamic library
         run: mise run dist:linux
       - name: Build Linux GDExtension library
@@ -77,6 +80,13 @@ jobs:
         with:
           name: takanawa-gdextension-linux-x86_64
           path: target/dist/takanawa-gdextension-linux-x86_64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: takanawa-node-linux-x64-gnu
+          path: |
+            packages/takanawa-node/takanawa.linux-x64-gnu.node
+            packages/takanawa-node/index.js
+          if-no-files-found: error
 
   artifact-windows:
     name: Build Windows release artifact (${{ matrix.target }})
@@ -101,6 +111,11 @@ jobs:
       - name: Enable sccache for Rust builds
         shell: bash
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - run: mise run install:node
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+      - name: Build and test Windows Node addon
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: pnpm --filter takanawa-node test
       - name: Build Windows dynamic library
         env:
           TAKANAWA_WINDOWS_TARGET: ${{ matrix.target }}
@@ -121,6 +136,12 @@ jobs:
         with:
           name: takanawa-gdextension-${{ matrix.artifact }}
           path: target/dist/takanawa-gdextension-${{ matrix.artifact }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        with:
+          name: takanawa-node-win32-x64-msvc
+          path: packages/takanawa-node/takanawa.win32-x64-msvc.node
+          if-no-files-found: error
 
   artifact-apple:
     name: Build Apple release artifacts
@@ -137,6 +158,13 @@ jobs:
       - name: Enable sccache for Rust builds
         shell: bash
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - run: mise run install:node
+      - name: Build and test macOS Node addon
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: pnpm --filter takanawa-node test
+      - name: Verify macOS minimum version
+        run: vtool -show-build packages/takanawa-node/takanawa.darwin-arm64.node | grep -E 'minos[[:space:]]+11\.0'
       - name: Build macOS dynamic library and Apple XCFramework
         run: mise run dist:macos-universal
       - name: Build Apple SwiftPM artifacts
@@ -161,6 +189,11 @@ jobs:
         with:
           name: takanawa-gdextension-apple
           path: target/dist/takanawa-gdextension-apple.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: takanawa-node-darwin-arm64
+          path: packages/takanawa-node/takanawa.darwin-arm64.node
+          if-no-files-found: error
 
   artifact-android:
     name: Build Android release artifact
@@ -299,7 +332,10 @@ jobs:
   npm-publish:
     name: pnpm publish
     runs-on: ubuntu-latest
-    needs: artifact-apple
+    needs:
+      - artifact-linux
+      - artifact-windows
+      - artifact-apple
     environment: npm-registry
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     steps:
@@ -312,6 +348,16 @@ jobs:
         with:
           name: Takanawa.xcframework-swiftpm
           path: target/swiftpm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: takanawa-node-*
+          path: packages/takanawa-node
+          merge-multiple: true
+      - run: |
+          test -f packages/takanawa-node/index.js
+          test -f packages/takanawa-node/takanawa.linux-x64-gnu.node
+          test -f packages/takanawa-node/takanawa.darwin-arm64.node
+          test -f packages/takanawa-node/takanawa.win32-x64-msvc.node
       - uses: mozilla-actions/sccache-action@v0.0.10
       - name: Enable sccache for Rust builds
         shell: bash

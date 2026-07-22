@@ -19,3 +19,17 @@ test('exports public API', () => {
     assert.equal(typeof DownloadTask.prototype[method], 'function')
   }
 })
+
+test('calls the native binding', async () => {
+  const task = new DownloadTask({
+    url: 'http://127.0.0.1:1/file',
+    targetPath: 'unused'
+  })
+
+  try {
+    const snapshot = await task.snapshot()
+    assert.equal(snapshot.phase, 'created')
+  } finally {
+    await task.close()
+  }
+})

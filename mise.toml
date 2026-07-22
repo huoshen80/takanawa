@@ -12,7 +12,8 @@ rust = { version = "1.96.0", components = "rustfmt,clippy" }
 
 [tasks."install:node"]
 description = "Install pnpm workspace dependencies"
-run = "CI=true pnpm install --frozen-lockfile"
+env = { CI = "true" }
+run = "pnpm install --frozen-lockfile"
 sources = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/*/package.json"]
 outputs = ["node_modules/.modules.yaml"]
 

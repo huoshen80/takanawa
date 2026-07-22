@@ -31,8 +31,17 @@ pub(crate) fn npm_publish(mode: &str) -> Result<()> {
     }
 
     for package in &packages {
-        println!("::group::pnpm --filter {} build", package.name);
-        run_command(pnpm_command(&pnpm_cache).args(["--filter", package.name.as_str(), "build"]))?;
+        let build_script = if mode == "publish" && package.name == "takanawa-node" {
+            "build:ts"
+        } else {
+            "build"
+        };
+        println!("::group::pnpm --filter {} {build_script}", package.name);
+        run_command(pnpm_command(&pnpm_cache).args([
+            "--filter",
+            package.name.as_str(),
+            build_script,
+        ]))?;
         println!("::endgroup::");
     }
 

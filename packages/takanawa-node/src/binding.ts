@@ -1,21 +1,22 @@
 import { createRequire } from 'node:module'
+import type { TakanawaStatusCode } from 'takanawa-js-core'
 
 const require = createRequire(import.meta.url)
 
 export interface NativeDownloadOptions {
   url: string
-  target_path: string
-  chunk_size?: string
+  targetPath: string
+  chunkSize?: string
   parallelism?: number
-  max_parallel_chunks?: number
-  max_io?: number
-  max_retries?: number
-  backoff_initial_ms?: number
-  backoff_max_ms?: number
-  connect_timeout_ms?: number
-  read_timeout_ms?: number
-  total_timeout_ms?: number
-  bytes_per_second_limit?: string
+  maxParallelChunks?: number
+  maxIo?: number
+  maxRetries?: number
+  backoffInitialMs?: number
+  backoffMaxMs?: number
+  connectTimeoutMs?: number
+  readTimeoutMs?: number
+  totalTimeoutMs?: number
+  bytesPerSecondLimit?: string
   hash?: NativeHashConfig
   sha256?: string
 }
@@ -27,24 +28,24 @@ export interface NativeHashConfig {
 
 export interface NativeDownloadSnapshot {
   phase: string
-  content_len: string
-  downloaded_bytes: string
-  chunk_size: string
-  chunk_count: string
-  completed_chunks: string
-  active_io: number
-  last_error?: string
-  last_error_code?: number
+  contentLen: string
+  downloadedBytes: string
+  chunkSize: string
+  chunkCount: string
+  completedChunks: string
+  activeIo: number
+  lastError?: string
+  lastErrorCode?: TakanawaStatusCode
 }
 
 export interface NativeDownloadSpeedSnapshot {
   phase: string
-  content_len: string
-  received_bytes: string
-  interval_bytes: string
-  elapsed_millis: string
-  bytes_per_second: number
-  active_io: number
+  contentLen: string
+  receivedBytes: string
+  intervalBytes: string
+  elapsedMillis: string
+  bytesPerSecond: number
+  activeIo: number
 }
 
 export interface NativeDownloadTask {

@@ -3,6 +3,17 @@
 Node.js and Electron bindings for Takanawa, built with napi-rs and wrapped with
 the shared Takanawa TypeScript API.
 
+## Platforms
+
+- Linux x64 (glibc)
+- macOS 11 or newer on Apple silicon
+- Windows x64
+
+## TODO
+
+- [ ] Build, test, and publish the Linux ARM64 GNU/glibc addon (`aarch64-unknown-linux-gnu`).
+- [ ] Build, test, and publish the Intel macOS x64 addon (`x86_64-apple-darwin`).
+
 ## Development
 
 ```sh
