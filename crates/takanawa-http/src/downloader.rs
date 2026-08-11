@@ -147,7 +147,14 @@ impl TimeoutConfig {
 #[derive(Debug, Clone)]
 pub struct DownloadEngine {
     client: Client,
+    client_mode: ClientMode,
     limiter: IoLimiter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientMode {
+    Internal,
+    External,
 }
 
 impl DownloadEngine {
@@ -160,8 +167,23 @@ impl DownloadEngine {
         let client = build_client(TimeoutConfig::default().normalized())?;
         Ok(Self {
             client,
+            client_mode: ClientMode::Internal,
             limiter: IoLimiter::new(max_io.max(1)),
         })
+    }
+
+    #[must_use]
+    /// Creates a download engine backed by a caller-provided HTTP client.
+    ///
+    /// Per-download timeout settings do not rebuild or alter an injected client.
+    /// Configure proxy, TLS, headers, and timeouts on the client before passing it
+    /// to this method.
+    pub fn with_client(client: Client, max_io: usize) -> Self {
+        Self {
+            client,
+            client_mode: ClientMode::External,
+            limiter: IoLimiter::new(max_io.max(1)),
+        }
     }
 
     #[must_use]
@@ -190,8 +212,12 @@ impl DownloadEngine {
     }
 
     fn with_timeout(&self, timeout: TimeoutConfig) -> Result<Self> {
+        if self.client_mode == ClientMode::External {
+            return Ok(self.clone());
+        }
         Ok(Self {
             client: build_client(timeout)?,
+            client_mode: ClientMode::Internal,
             limiter: self.limiter.clone(),
         })
     }
@@ -1109,6 +1135,50 @@ mod tests {
 
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    #[test]
+    fn injected_client_is_preserved_when_applying_download_timeouts() {
+        let engine = DownloadEngine::with_client(Client::new(), 7);
+        let configured = engine
+            .with_timeout(TimeoutConfig {
+                connect: Duration::from_millis(1),
+                read: Duration::from_millis(1),
+                total: Duration::from_millis(1),
+            })
+            .unwrap();
+
+        assert_eq!(configured.client_mode, ClientMode::External);
+        assert_eq!(configured.max_io(), 7);
+    }
+
+    #[tokio::test]
+    async fn injected_client_routes_download_through_http_proxy() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let proxy_addr = spawn_range_server(Arc::clone(&data), false);
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let engine = DownloadEngine::with_client(client, DEFAULT_MAX_IO);
+        let config = DownloadConfig {
+            url: "http://origin.invalid/file".to_owned(),
+            target_path: target.clone(),
+            chunk_size: 5,
+            parallelism: 2,
+            max_parallel_chunks: 0,
+            retry: RetryConfig::default(),
+            timeout: TimeoutConfig::default(),
+            bytes_per_second_limit: 0,
+            hash: HashConfig::None,
+        };
+
+        let snapshot = download_to_completion(engine, config).await.unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+    }
 
     use super::*;
     use crate::DownloadPhase;
