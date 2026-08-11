@@ -395,6 +395,12 @@ impl DownloadHandle {
     }
 
     #[must_use]
+    /// Returns the HTTP response status associated with the latest failure.
+    pub fn last_http_status(&self) -> Option<u16> {
+        self.state.last_http_status()
+    }
+
+    #[must_use]
     /// Returns the current serialized completion bitmap.
     ///
     /// # Panics
@@ -1034,9 +1040,7 @@ fn validate_status(status: StatusCode) -> Result<()> {
     {
         return Err(TakanawaError::RetryableHttpStatus(status.as_u16()));
     }
-    Err(TakanawaError::HttpProtocol(format!(
-        "expected 206 Partial Content, got {status}"
-    )))
+    Err(TakanawaError::HttpStatus(status.as_u16()))
 }
 
 fn validate_identity(headers: &HeaderMap) -> Result<()> {
@@ -1140,6 +1144,15 @@ mod tests {
 
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    #[test]
+    fn exposes_permanent_http_status_without_message_parsing() {
+        let error = validate_status(StatusCode::UNAUTHORIZED).unwrap_err();
+
+        assert!(matches!(error, TakanawaError::HttpStatus(401)));
+        assert_eq!(error.http_status(), Some(401));
+        assert!(!error.is_retryable());
+    }
 
     #[test]
     fn injected_client_is_preserved_when_applying_download_timeouts() {

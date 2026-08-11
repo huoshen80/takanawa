@@ -40,6 +40,10 @@ pub enum TakanawaError {
     #[error("HTTP protocol violation: expected 206 Partial Content, got {status}")]
     RangeNotHonored { status: u16 },
 
+    /// Non-retryable HTTP response status.
+    #[error("unexpected HTTP status: {0}")]
+    HttpStatus(u16),
+
     /// HTTP status that can be retried by the caller.
     #[error("retryable HTTP status: {0}")]
     RetryableHttpStatus(u16),
@@ -114,9 +118,10 @@ impl TakanawaError {
             Self::PartSizeMismatch { .. } => -12,
             Self::PartCorrupt(_) => -13,
             Self::RemoteChanged(_) => -14,
-            Self::HttpProtocol(_) | Self::RangeNotHonored { .. } | Self::RetryableHttpStatus(_) => {
-                -20
-            }
+            Self::HttpProtocol(_)
+            | Self::RangeNotHonored { .. }
+            | Self::HttpStatus(_)
+            | Self::RetryableHttpStatus(_) => -20,
             Self::Network(_) => -21,
             Self::Io(_) => -30,
             Self::HashMismatch => -40,
@@ -133,5 +138,16 @@ impl TakanawaError {
             self,
             Self::Network(_) | Self::RangeNotHonored { .. } | Self::RetryableHttpStatus(_)
         )
+    }
+
+    #[must_use]
+    /// Returns the HTTP response status associated with this error, when present.
+    pub const fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::RangeNotHonored { status }
+            | Self::HttpStatus(status)
+            | Self::RetryableHttpStatus(status) => Some(*status),
+            _ => None,
+        }
     }
 }

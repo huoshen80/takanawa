@@ -125,6 +125,7 @@ struct Progress {
     bitmap: Vec<u8>,
     last_error: Option<String>,
     last_error_code: Option<i32>,
+    last_http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +357,7 @@ impl SharedState {
                     bitmap: Vec::new(),
                     last_error: None,
                     last_error_code: None,
+                    last_http_status: None,
                 }),
                 speed: Mutex::new(SpeedProgress {
                     content_len: 0,
@@ -481,6 +483,7 @@ impl SharedState {
             progress.lifecycle = progress.lifecycle.mark_failed();
             progress.last_error = Some(error.to_string());
             progress.last_error_code = Some(error.status_code());
+            progress.last_http_status = error.http_status();
         }
         self.notify_progress();
     }
@@ -493,6 +496,16 @@ impl SharedState {
             .expect("download state mutex poisoned");
         progress.last_error = None;
         progress.last_error_code = None;
+        progress.last_http_status = None;
+    }
+
+    #[must_use]
+    pub fn last_http_status(&self) -> Option<u16> {
+        self.inner
+            .progress
+            .lock()
+            .expect("download state mutex poisoned")
+            .last_http_status
     }
 
     pub fn update_from_metadata(&self, metadata: &PartMetadata) {
