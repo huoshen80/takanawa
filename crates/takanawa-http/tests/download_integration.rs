@@ -111,7 +111,33 @@ async fn rejects_server_that_ignores_ranges() {
     .await
     .expect_err("download should reject non-range response");
 
-    assert!(matches!(err, TakanawaError::HttpProtocol(_)));
+    assert!(matches!(
+        err,
+        TakanawaError::RangeNotHonored { status: 200 }
+    ));
+}
+
+#[tokio::test]
+async fn retries_when_server_temporarily_ignores_range() {
+    let data = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    let server = RangeServer::spawn_ignoring_first_range(data.clone());
+    let dir = TempDir::new().expect("temp dir should be created");
+    let target = dir.path().join("out.bin");
+    let mut config = download_config(server.url(), target.clone(), HashConfig::None);
+    config.retry.max_retries = 1;
+
+    let snapshot = download_to_completion(
+        DownloadEngine::new(DEFAULT_MAX_IO).expect("engine should be created"),
+        config,
+    )
+    .await
+    .expect("download should retry and complete");
+
+    assert_eq!(snapshot.phase, DownloadPhase::Completed);
+    assert_eq!(
+        fs::read(target).expect("downloaded file should be readable"),
+        data
+    );
 }
 
 #[test]

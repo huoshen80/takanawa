@@ -36,6 +36,10 @@ pub enum TakanawaError {
     #[error("HTTP protocol violation: {0}")]
     HttpProtocol(String),
 
+    /// The server returned a full response to a byte-range request.
+    #[error("HTTP protocol violation: expected 206 Partial Content, got {status}")]
+    RangeNotHonored { status: u16 },
+
     /// HTTP status that can be retried by the caller.
     #[error("retryable HTTP status: {0}")]
     RetryableHttpStatus(u16),
@@ -110,7 +114,9 @@ impl TakanawaError {
             Self::PartSizeMismatch { .. } => -12,
             Self::PartCorrupt(_) => -13,
             Self::RemoteChanged(_) => -14,
-            Self::HttpProtocol(_) | Self::RetryableHttpStatus(_) => -20,
+            Self::HttpProtocol(_) | Self::RangeNotHonored { .. } | Self::RetryableHttpStatus(_) => {
+                -20
+            }
             Self::Network(_) => -21,
             Self::Io(_) => -30,
             Self::HashMismatch => -40,
@@ -123,6 +129,9 @@ impl TakanawaError {
     #[must_use]
     /// Returns whether retrying the operation may succeed.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Network(_) | Self::RetryableHttpStatus(_))
+        matches!(
+            self,
+            Self::Network(_) | Self::RangeNotHonored { .. } | Self::RetryableHttpStatus(_)
+        )
     }
 }

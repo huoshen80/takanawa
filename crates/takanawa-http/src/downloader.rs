@@ -1023,6 +1023,11 @@ fn validate_status(status: StatusCode) -> Result<()> {
     if status == StatusCode::PARTIAL_CONTENT {
         return Ok(());
     }
+    if status == StatusCode::OK {
+        return Err(TakanawaError::RangeNotHonored {
+            status: status.as_u16(),
+        });
+    }
     if status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
@@ -1263,7 +1268,10 @@ mod tests {
 
         let err = download_to_completion(engine, config).await.unwrap_err();
 
-        assert!(matches!(err, TakanawaError::HttpProtocol(_)));
+        assert!(matches!(
+            err,
+            TakanawaError::RangeNotHonored { status: 200 }
+        ));
     }
 
     #[tokio::test]

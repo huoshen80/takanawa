@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use takanawa_http::{DownloadHandle, DownloadPhase, DownloadSnapshot};
 enum ServerMode {
     Range,
     IgnoreRange,
+    IgnoreFirstRange,
     DelayChunks(Duration),
 }
 
@@ -24,6 +26,10 @@ impl RangeServer {
 
     pub fn spawn_ignoring_ranges(data: Vec<u8>) -> Self {
         spawn_server(Arc::new(data), ServerMode::IgnoreRange)
+    }
+
+    pub fn spawn_ignoring_first_range(data: Vec<u8>) -> Self {
+        spawn_server(Arc::new(data), ServerMode::IgnoreFirstRange)
     }
 
     pub fn spawn_delayed_chunks(data: Vec<u8>, delay: Duration) -> Self {
@@ -51,22 +57,32 @@ fn spawn_server(data: Arc<Vec<u8>>, mode: ServerMode) -> RangeServer {
     let addr = listener
         .local_addr()
         .expect("test server should have an address");
+    let request_count = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let data = Arc::clone(&data);
-            thread::spawn(move || handle_connection(stream, &data, mode));
+            let request_count = Arc::clone(&request_count);
+            thread::spawn(move || handle_connection(stream, &data, mode, &request_count));
         }
     });
     RangeServer { addr }
 }
 
-fn handle_connection(mut stream: TcpStream, data: &[u8], mode: ServerMode) {
+fn handle_connection(
+    mut stream: TcpStream,
+    data: &[u8],
+    mode: ServerMode,
+    request_count: &AtomicUsize,
+) {
     let mut buffer = [0; 4096];
     let read = stream.read(&mut buffer).unwrap_or(0);
     let request = String::from_utf8_lossy(&buffer[..read]);
     let range = request_range(&request);
 
-    if matches!(mode, ServerMode::IgnoreRange) {
+    let request_number = request_count.fetch_add(1, Ordering::Relaxed);
+    if matches!(mode, ServerMode::IgnoreRange)
+        || matches!(mode, ServerMode::IgnoreFirstRange) && request_number == 0
+    {
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             data.len()
