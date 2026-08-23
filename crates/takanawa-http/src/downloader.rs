@@ -708,6 +708,21 @@ struct ChunkFetchContext<'a> {
     writer_tx: &'a mpsc::Sender<WriterCommand>,
 }
 
+struct ForbiddenRecoveryContext<'a> {
+    engine: &'a DownloadEngine,
+    config: &'a DownloadConfig,
+    state: &'a SharedState,
+    control: &'a Control,
+    source: &'a DownloadSource,
+    concurrency: &'a AdaptiveConcurrency,
+}
+
+enum ForbiddenRecovery {
+    Retry { url_changed: bool },
+    Paused,
+    Rejected,
+}
+
 #[derive(Debug)]
 struct HttpAttemptError {
     error: TakanawaError,
@@ -727,7 +742,9 @@ type HttpAttemptResult<T> = std::result::Result<T, HttpAttemptError>;
 
 #[derive(Debug)]
 struct AdaptiveConcurrency {
+    initial: usize,
     current: AtomicUsize,
+    forbidden_refresh_available: AtomicBool,
     limiter: IoLimiter,
     timing: Mutex<AdaptiveTiming>,
 }
@@ -748,7 +765,9 @@ impl AdaptiveConcurrency {
     fn new(initial: usize) -> Self {
         let initial = initial.max(1);
         Self {
+            initial,
             current: AtomicUsize::new(initial),
+            forbidden_refresh_available: AtomicBool::new(true),
             limiter: IoLimiter::new(initial),
             timing: Mutex::new(AdaptiveTiming {
                 last_decrease: None,
@@ -761,14 +780,28 @@ impl AdaptiveConcurrency {
         self.current.load(Ordering::Relaxed)
     }
 
+    fn forbidden_retry_budget(&self) -> u32 {
+        let mut current = self.initial;
+        let mut reductions = 0_u32;
+        while current > 1 {
+            current = current.div_ceil(2);
+            reductions = reductions.saturating_add(1);
+        }
+        reductions.saturating_mul(2).saturating_add(2)
+    }
+
     async fn acquire(&self, control: &Control) -> Result<Option<AdaptivePermit>> {
         loop {
+            if let Some(request) = control.requested() {
+                return interrupted(request);
+            }
             if let Some(request) = self.wait_until_ready(control).await {
                 return interrupted(request);
             }
             let permit = tokio::select! {
-                permit = self.limiter.acquire() => permit,
+                biased;
                 request = control.wait_for_request() => return interrupted(request),
+                permit = self.limiter.acquire() => permit,
             };
             if self.remaining_wait(Instant::now()).is_zero() {
                 return Ok(Some(AdaptivePermit {
@@ -811,6 +844,27 @@ impl AdaptiveConcurrency {
             .expect("adaptive concurrency mutex poisoned");
         timing.retry_not_before = timing.retry_not_before.max(now + delay);
 
+        self.decrease_concurrency(attempt_started_at, now, &mut timing);
+    }
+
+    fn report_forbidden(&self, attempt_started_at: Instant) {
+        self.report_forbidden_at(attempt_started_at, Instant::now());
+    }
+
+    fn report_forbidden_at(&self, attempt_started_at: Instant, now: Instant) {
+        let mut timing = self
+            .timing
+            .lock()
+            .expect("adaptive concurrency mutex poisoned");
+        self.decrease_concurrency(attempt_started_at, now, &mut timing);
+    }
+
+    fn decrease_concurrency(
+        &self,
+        attempt_started_at: Instant,
+        now: Instant,
+        timing: &mut AdaptiveTiming,
+    ) {
         if timing
             .last_decrease
             .is_some_and(|last_decrease| attempt_started_at <= last_decrease)
@@ -826,6 +880,30 @@ impl AdaptiveConcurrency {
         self.current.store(next, Ordering::Relaxed);
         self.limiter.set_max(next);
         timing.last_decrease = Some(now);
+    }
+
+    fn attempt_uses_current_limit(&self, attempt_started_at: Instant) -> bool {
+        self.timing
+            .lock()
+            .expect("adaptive concurrency mutex poisoned")
+            .last_decrease
+            .is_none_or(|last_decrease| attempt_started_at > last_decrease)
+    }
+
+    fn reset_after_url_change(&self) {
+        let mut timing = self
+            .timing
+            .lock()
+            .expect("adaptive concurrency mutex poisoned");
+        timing.last_decrease = None;
+        self.current.store(self.initial, Ordering::Relaxed);
+        self.limiter.set_max(self.initial);
+    }
+
+    fn claim_forbidden_refresh(&self) -> bool {
+        self.forbidden_refresh_available
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
@@ -847,6 +925,12 @@ struct EffectiveUrlState {
     url: Url,
     generation: u64,
     redirected: bool,
+}
+
+enum SourceRefresh {
+    Refreshed { url_changed: bool },
+    Reused,
+    Paused,
 }
 
 #[derive(Debug)]
@@ -894,22 +978,23 @@ impl DownloadSource {
         config: &DownloadConfig,
         state: &SharedState,
         control: &Control,
-    ) -> Result<bool> {
+    ) -> Result<SourceRefresh> {
         let _refresh = self.refresh.lock().await;
         if self.snapshot_without_refresh_lock().generation != observed_generation {
-            return Ok(true);
+            return Ok(SourceRefresh::Reused);
         }
 
         let Some(refreshed) = probe_with_retry(engine, config, state, control).await? else {
-            return Ok(false);
+            return Ok(SourceRefresh::Paused);
         };
         ensure_same_remote(&self.initial_remote, &refreshed.remote)?;
 
         let mut source = self.state.lock().expect("download source mutex poisoned");
+        let url_changed = source.url != refreshed.effective_url;
         source.redirected = self.original_url != refreshed.effective_url;
         source.url = refreshed.effective_url;
         source.generation = source.generation.saturating_add(1);
-        Ok(true)
+        Ok(SourceRefresh::Refreshed { url_changed })
     }
 }
 
@@ -1083,13 +1168,9 @@ async fn fetch_chunk_with_retry(
     } = context;
     let retry = config.retry.normalized();
     let mut delay = retry.backoff_initial;
-    for attempt in 1..=retry.max_attempts() {
-        if control.cancel.load(Ordering::Relaxed) {
-            return Err(TakanawaError::Cancelled);
-        }
-        if control.pause.load(Ordering::Relaxed) {
-            return Ok(ChunkTaskResult::Paused);
-        }
+    let mut attempt = 1_u32;
+    let mut forbidden_retries = concurrency.forbidden_retry_budget();
+    loop {
         let Some(attempt_permit) = concurrency.acquire(control).await? else {
             return Ok(ChunkTaskResult::Paused);
         };
@@ -1111,27 +1192,51 @@ async fn fetch_chunk_with_retry(
         match attempt_result {
             Ok(FetchChunkStatus::Complete) => {
                 drop(attempt_permit);
-                if control.cancel.load(Ordering::Relaxed) {
-                    return Err(TakanawaError::Cancelled);
-                }
-                if control.pause.load(Ordering::Relaxed) {
-                    return Ok(ChunkTaskResult::Paused);
-                }
-                let metadata = commit_written_chunk(writer_tx, chunk.index).await?;
-                return Ok(ChunkTaskResult::Committed(Box::new(metadata)));
+                return commit_fetched_chunk(writer_tx, chunk.index, control).await;
             }
             Ok(FetchChunkStatus::Paused) => return Ok(ChunkTaskResult::Paused),
             Err(err)
-                if matches!(err.error.http_status(), Some(401 | 403))
+                if err.error.http_status() == Some(401)
                     && source_snapshot.redirected
                     && attempt < retry.max_attempts() =>
             {
                 drop(attempt_permit);
-                let refreshed = source
+                let refresh = source
                     .refresh_if_stale(source_snapshot.generation, engine, config, state, control)
                     .await?;
-                if !refreshed {
+                if matches!(refresh, SourceRefresh::Paused) {
                     return Ok(ChunkTaskResult::Paused);
+                }
+                attempt = attempt.saturating_add(1);
+            }
+            Err(err) if err.error.http_status() == Some(403) && source_snapshot.redirected => {
+                drop(attempt_permit);
+                let recovery = recover_forbidden_chunk(
+                    ForbiddenRecoveryContext {
+                        engine,
+                        config,
+                        state,
+                        control,
+                        source,
+                        concurrency,
+                    },
+                    source_snapshot.generation,
+                    attempt_started_at,
+                    &mut forbidden_retries,
+                )
+                .await?;
+                match recovery {
+                    ForbiddenRecovery::Retry { url_changed } => {
+                        if url_changed {
+                            delay = retry.backoff_initial;
+                        }
+                        if let Some(result) = wait_for_chunk_retry(delay, control).await? {
+                            return Ok(result);
+                        }
+                        delay = (delay * 2).min(retry.backoff_max);
+                    }
+                    ForbiddenRecovery::Paused => return Ok(ChunkTaskResult::Paused),
+                    ForbiddenRecovery::Rejected => return Err(err.error),
                 }
             }
             Err(err) if err.error.is_retryable() && attempt < retry.max_attempts() => {
@@ -1140,21 +1245,91 @@ async fn fetch_chunk_with_retry(
                     concurrency.report_rate_limit(attempt_started_at, retry_delay);
                 }
                 drop(attempt_permit);
-                if let Some(request) = wait_for_retry_delay(retry_delay, control).await {
-                    return match request {
-                        ControlRequest::Pause => Ok(ChunkTaskResult::Paused),
-                        ControlRequest::Cancel => Err(TakanawaError::Cancelled),
-                    };
+                if let Some(result) = wait_for_chunk_retry(retry_delay, control).await? {
+                    return Ok(result);
                 }
                 delay = (delay * 2).min(retry.backoff_max);
+                attempt = attempt.saturating_add(1);
             }
             Err(err) => return Err(err.error),
         }
     }
-    Err(TakanawaError::Network(format!(
-        "chunk {} exhausted retry attempts",
-        chunk.index
-    )))
+}
+
+async fn wait_for_chunk_retry(
+    delay: Duration,
+    control: &Control,
+) -> Result<Option<ChunkTaskResult>> {
+    match wait_for_retry_delay(delay, control).await {
+        Some(ControlRequest::Pause) => Ok(Some(ChunkTaskResult::Paused)),
+        Some(ControlRequest::Cancel) => Err(TakanawaError::Cancelled),
+        None => Ok(None),
+    }
+}
+
+async fn commit_fetched_chunk(
+    writer_tx: &mpsc::Sender<WriterCommand>,
+    chunk_index: u64,
+    control: &Control,
+) -> Result<ChunkTaskResult> {
+    if control.cancel.load(Ordering::Relaxed) {
+        return Err(TakanawaError::Cancelled);
+    }
+    if control.pause.load(Ordering::Relaxed) {
+        return Ok(ChunkTaskResult::Paused);
+    }
+    let metadata = commit_written_chunk(writer_tx, chunk_index).await?;
+    Ok(ChunkTaskResult::Committed(Box::new(metadata)))
+}
+
+async fn recover_forbidden_chunk(
+    context: ForbiddenRecoveryContext<'_>,
+    source_generation: u64,
+    attempt_started_at: Instant,
+    remaining_retries: &mut u32,
+) -> Result<ForbiddenRecovery> {
+    if *remaining_retries == 0 {
+        return Ok(ForbiddenRecovery::Rejected);
+    }
+    if context.concurrency.current() > 1 {
+        context.concurrency.report_forbidden(attempt_started_at);
+        return Ok(consume_forbidden_retry(remaining_retries, false));
+    }
+    if !context
+        .concurrency
+        .attempt_uses_current_limit(attempt_started_at)
+    {
+        return Ok(consume_forbidden_retry(remaining_retries, false));
+    }
+    if !context.concurrency.claim_forbidden_refresh() {
+        return Ok(ForbiddenRecovery::Rejected);
+    }
+
+    let refresh = context
+        .source
+        .refresh_if_stale(
+            source_generation,
+            context.engine,
+            context.config,
+            context.state,
+            context.control,
+        )
+        .await?;
+    Ok(match refresh {
+        SourceRefresh::Refreshed { url_changed } => {
+            if url_changed {
+                context.concurrency.reset_after_url_change();
+            }
+            consume_forbidden_retry(remaining_retries, url_changed)
+        }
+        SourceRefresh::Reused => consume_forbidden_retry(remaining_retries, false),
+        SourceRefresh::Paused => ForbiddenRecovery::Paused,
+    })
+}
+
+fn consume_forbidden_retry(remaining_retries: &mut u32, url_changed: bool) -> ForbiddenRecovery {
+    *remaining_retries = remaining_retries.saturating_sub(1);
+    ForbiddenRecovery::Retry { url_changed }
 }
 
 async fn probe_once(
@@ -1642,6 +1817,18 @@ mod tests {
         assert_eq!(concurrency.current(), 1);
     }
 
+    #[test]
+    fn changed_url_restores_initial_concurrency() {
+        let concurrency = AdaptiveConcurrency::new(8);
+        let started_at = Instant::now();
+        concurrency.report_forbidden_at(started_at, started_at + Duration::from_millis(1));
+        assert_eq!(concurrency.current(), 4);
+
+        concurrency.reset_after_url_change();
+
+        assert_eq!(concurrency.current(), 8);
+    }
+
     #[tokio::test]
     async fn reduced_limit_does_not_cancel_existing_attempts() {
         let concurrency = Arc::new(AdaptiveConcurrency::new(8));
@@ -1775,12 +1962,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refreshes_expired_effective_url_once_for_concurrent_chunks() {
+    async fn refreshes_forbidden_effective_url_after_concurrency_fallback() {
         let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
         let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::ExpireThenRefresh);
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("out.bin");
-        let config = test_download_config(server.original_url(), target.clone(), 5, 4, 1);
+        let config = test_download_config(server.original_url(), target.clone(), 5, 4, 4);
 
         let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
             .await
@@ -1821,6 +2008,100 @@ mod tests {
 
         assert!(matches!(err, TakanawaError::HttpStatus(403)));
         assert_eq!(server.resolver_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn forbidden_effective_url_reduces_concurrency_before_refreshing() {
+        let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz0123456789ABCD".to_vec());
+        let server = spawn_redirect_server(
+            Arc::clone(&data),
+            RedirectMode::ForbiddenThenAllow { failures: 12 },
+        );
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target.clone(), 5, 8, 0);
+
+        let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+        assert_eq!(server.rejected_requests(), 12);
+        assert_eq!(server.resolver_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbidden_fallback_reaches_refresh_from_sixteen_connections() {
+        let data = Arc::new(vec![b'x'; 80]);
+        let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::AlwaysForbidden);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target, 5, 16, 0);
+
+        let err = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TakanawaError::HttpStatus(403)));
+        assert_eq!(server.resolver_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn forbidden_fallback_uses_configured_backoff() {
+        let data = Arc::new(b"abcde".to_vec());
+        let server = spawn_redirect_server(
+            Arc::clone(&data),
+            RedirectMode::ForbiddenThenAllow { failures: 1 },
+        );
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let mut config = test_download_config(server.original_url(), target, 5, 2, 0);
+        config.retry.backoff_initial = Duration::from_millis(40);
+        config.retry.backoff_max = Duration::from_millis(40);
+
+        let started = Instant::now();
+        let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert_eq!(server.resolver_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbidden_at_single_concurrency_refreshes_once_then_fails() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::AlwaysForbidden);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target, 5, 1, 4);
+
+        let err = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TakanawaError::HttpStatus(403)));
+        assert_eq!(server.resolver_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_effective_url_refreshes_without_concurrency_fallback() {
+        let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
+        let server =
+            spawn_redirect_server(Arc::clone(&data), RedirectMode::UnauthorizedThenRefresh);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target.clone(), 5, 4, 1);
+
+        let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+        assert_eq!(server.resolver_requests(), 2);
     }
 
     #[tokio::test]
@@ -2192,11 +2473,15 @@ mod tests {
         Stable,
         ExpireThenRefresh,
         RefreshChangesLength,
+        UnauthorizedThenRefresh,
+        ForbiddenThenAllow { failures: usize },
+        AlwaysForbidden,
     }
 
     struct RedirectServer {
         addr: SocketAddr,
         resolver_requests: Arc<AtomicUsize>,
+        rejected_requests: Arc<AtomicUsize>,
     }
 
     struct RetryStatusServer {
@@ -2225,6 +2510,10 @@ mod tests {
 
         fn resolver_requests(&self) -> usize {
             self.resolver_requests.load(AtomicOrdering::SeqCst)
+        }
+
+        fn rejected_requests(&self) -> usize {
+            self.rejected_requests.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -2257,18 +2546,29 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let resolver_requests = Arc::new(AtomicUsize::new(0));
         let server_requests = Arc::clone(&resolver_requests);
+        let rejected_requests = Arc::new(AtomicUsize::new(0));
+        let server_rejections = Arc::clone(&rejected_requests);
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let data = Arc::clone(&data);
                 let resolver_requests = Arc::clone(&server_requests);
+                let rejected_requests = Arc::clone(&server_rejections);
                 thread::spawn(move || {
-                    handle_redirect_connection(stream, addr, &data, mode, &resolver_requests);
+                    handle_redirect_connection(
+                        stream,
+                        addr,
+                        &data,
+                        mode,
+                        &resolver_requests,
+                        &rejected_requests,
+                    );
                 });
             }
         });
         RedirectServer {
             addr,
             resolver_requests,
+            rejected_requests,
         }
     }
 
@@ -2356,6 +2656,7 @@ mod tests {
         data: &[u8],
         mode: RedirectMode,
         resolver_requests: &AtomicUsize,
+        rejected_requests: &AtomicUsize,
     ) {
         let mut buffer = [0; 4096];
         let read = stream.read(&mut buffer).unwrap_or(0);
@@ -2396,15 +2697,44 @@ mod tests {
             return;
         }
 
-        if path == "/effective/0"
-            && !matches!(mode, RedirectMode::Stable)
-            && !(start == 0 && end == 0)
-        {
-            stream
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
+        let is_probe = start == 0 && end == 0;
+        let rejection_status = if is_probe {
+            None
+        } else {
+            match mode {
+                RedirectMode::ExpireThenRefresh | RedirectMode::RefreshChangesLength
+                    if path == "/effective/0" =>
+                {
+                    Some(403)
+                }
+                RedirectMode::UnauthorizedThenRefresh if path == "/effective/0" => Some(401),
+                RedirectMode::ForbiddenThenAllow { failures } => rejected_requests
+                    .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |count| {
+                        (count < failures).then_some(count.saturating_add(1))
+                    })
+                    .is_ok()
+                    .then_some(403),
+                RedirectMode::AlwaysForbidden => Some(403),
+                RedirectMode::Stable
+                | RedirectMode::ExpireThenRefresh
+                | RedirectMode::RefreshChangesLength
+                | RedirectMode::UnauthorizedThenRefresh => None,
+            }
+        };
+        if let Some(status) = rejection_status {
+            rejected_requests.fetch_add(
+                usize::from(!matches!(mode, RedirectMode::ForbiddenThenAllow { .. })),
+                AtomicOrdering::SeqCst,
+            );
+            let reason = if status == 401 {
+                "Unauthorized"
+            } else {
+                "Forbidden"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
             return;
         }
 
