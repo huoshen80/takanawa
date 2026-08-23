@@ -11,7 +11,7 @@ use reqwest::header::{
     ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap,
     LAST_MODIFIED, RANGE,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, Url};
 use takanawa_core::{
     Chunk, ChunkPlan, DEFAULT_CHUNK_SIZE, HashConfig, PartFile, PartMetadata, RemoteInfo, Result,
     TakanawaError,
@@ -461,10 +461,12 @@ async fn run_download(
     if complete_startup_control_request(&state, &control)? {
         return Ok(());
     }
-    let remote = probe_with_retry(&engine, &config, &state, &control).await?;
+    let probe = probe_with_retry(&engine, &config, &state, &control).await?;
     if complete_startup_control_request(&state, &control)? {
         return Ok(());
     }
+    let source = Arc::new(DownloadSource::new(&config.url, &probe)?);
+    let remote = probe.remote;
     let chunk_plan = ChunkPlan::new(remote.content_len, config.chunk_size)?;
     let target_path = config.target_path.clone();
     let url = config.url.clone();
@@ -532,10 +534,20 @@ async fn run_download(
             let state = state.clone();
             let control = Arc::clone(&control);
             let bandwidth = Arc::clone(&bandwidth);
+            let source = Arc::clone(&source);
             let writer_tx = writer_tx.clone();
             tasks.spawn(async move {
                 let result = fetch_chunk_with_retry(
-                    &engine, &config, chunk, &state, &control, &bandwidth, &writer_tx,
+                    ChunkFetchContext {
+                        engine: &engine,
+                        config: &config,
+                        state: &state,
+                        control: &control,
+                        bandwidth: &bandwidth,
+                        source: &source,
+                        writer_tx: &writer_tx,
+                    },
+                    chunk,
                 )
                 .await?;
                 Ok::<_, TakanawaError>(result)
@@ -614,6 +626,122 @@ enum ChunkTaskResult {
 enum FetchChunkStatus {
     Complete,
     Paused,
+}
+
+struct ChunkFetchContext<'a> {
+    engine: &'a DownloadEngine,
+    config: &'a DownloadConfig,
+    state: &'a SharedState,
+    control: &'a Control,
+    bandwidth: &'a BandwidthLimiter,
+    source: &'a DownloadSource,
+    writer_tx: &'a mpsc::Sender<WriterCommand>,
+}
+
+#[derive(Debug)]
+struct ProbeResult {
+    remote: RemoteInfo,
+    effective_url: Url,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveUrlSnapshot {
+    url: Url,
+    generation: u64,
+    redirected: bool,
+}
+
+#[derive(Debug)]
+struct EffectiveUrlState {
+    url: Url,
+    generation: u64,
+    redirected: bool,
+}
+
+#[derive(Debug)]
+struct DownloadSource {
+    original_url: Url,
+    initial_remote: RemoteInfo,
+    state: Mutex<EffectiveUrlState>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+impl DownloadSource {
+    fn new(original_url: &str, probe: &ProbeResult) -> Result<Self> {
+        let original_url = Url::parse(original_url)
+            .map_err(|err| TakanawaError::InvalidConfig(format!("invalid download URL: {err}")))?;
+        Ok(Self {
+            state: Mutex::new(EffectiveUrlState {
+                redirected: original_url != probe.effective_url,
+                url: probe.effective_url.clone(),
+                generation: 0,
+            }),
+            original_url,
+            initial_remote: probe.remote.clone(),
+            refresh: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    async fn snapshot(&self) -> EffectiveUrlSnapshot {
+        let _refresh = self.refresh.lock().await;
+        self.snapshot_without_refresh_lock()
+    }
+
+    fn snapshot_without_refresh_lock(&self) -> EffectiveUrlSnapshot {
+        let state = self.state.lock().expect("download source mutex poisoned");
+        EffectiveUrlSnapshot {
+            url: state.url.clone(),
+            generation: state.generation,
+            redirected: state.redirected,
+        }
+    }
+
+    async fn refresh_if_stale(
+        &self,
+        observed_generation: u64,
+        engine: &DownloadEngine,
+        config: &DownloadConfig,
+        state: &SharedState,
+        control: &Control,
+    ) -> Result<()> {
+        let _refresh = self.refresh.lock().await;
+        if self.snapshot_without_refresh_lock().generation != observed_generation {
+            return Ok(());
+        }
+
+        let refreshed = probe_with_retry(engine, config, state, control).await?;
+        ensure_same_remote(&self.initial_remote, &refreshed.remote)?;
+
+        let mut source = self.state.lock().expect("download source mutex poisoned");
+        source.redirected = self.original_url != refreshed.effective_url;
+        source.url = refreshed.effective_url;
+        source.generation = source.generation.saturating_add(1);
+        Ok(())
+    }
+}
+
+fn ensure_same_remote(expected: &RemoteInfo, current: &RemoteInfo) -> Result<()> {
+    if expected.content_len != current.content_len {
+        return Err(TakanawaError::RemoteChanged(format!(
+            "content length changed from {} to {}",
+            expected.content_len, current.content_len
+        )));
+    }
+    if let (Some(expected), Some(current)) = (&expected.etag, &current.etag) {
+        if expected != current {
+            return Err(TakanawaError::RemoteChanged(format!(
+                "ETag changed from {expected} to {current}"
+            )));
+        }
+    }
+    if let (Some(expected), Some(current)) = (&expected.last_modified, &current.last_modified) {
+        if expected != current {
+            return Err(TakanawaError::RemoteChanged(format!(
+                "Last-Modified changed from {expected} to {current}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 enum WriterCommand {
@@ -717,7 +845,7 @@ async fn probe_with_retry(
     config: &DownloadConfig,
     state: &SharedState,
     control: &Control,
-) -> Result<RemoteInfo> {
+) -> Result<ProbeResult> {
     let retry = config.retry.normalized();
     let mut delay = retry.backoff_initial;
     for attempt in 1..=retry.max_attempts() {
@@ -740,14 +868,18 @@ async fn probe_with_retry(
 }
 
 async fn fetch_chunk_with_retry(
-    engine: &DownloadEngine,
-    config: &DownloadConfig,
+    context: ChunkFetchContext<'_>,
     chunk: Chunk,
-    state: &SharedState,
-    control: &Control,
-    bandwidth: &BandwidthLimiter,
-    writer_tx: &mpsc::Sender<WriterCommand>,
 ) -> Result<ChunkTaskResult> {
+    let ChunkFetchContext {
+        engine,
+        config,
+        state,
+        control,
+        bandwidth,
+        source,
+        writer_tx,
+    } = context;
     let retry = config.retry.normalized();
     let mut delay = retry.backoff_initial;
     for attempt in 1..=retry.max_attempts() {
@@ -757,11 +889,12 @@ async fn fetch_chunk_with_retry(
         if control.pause.load(Ordering::Relaxed) {
             return Ok(ChunkTaskResult::Paused);
         }
+        let source_snapshot = source.snapshot().await;
         match with_total_timeout(
             config.timeout.total,
             fetch_chunk_once(
                 engine,
-                &config.url,
+                &source_snapshot.url,
                 chunk,
                 state,
                 control,
@@ -782,6 +915,15 @@ async fn fetch_chunk_with_retry(
                 return Ok(ChunkTaskResult::Committed(Box::new(metadata)));
             }
             Ok(FetchChunkStatus::Paused) => return Ok(ChunkTaskResult::Paused),
+            Err(err)
+                if matches!(err.http_status(), Some(401 | 403))
+                    && source_snapshot.redirected
+                    && attempt < retry.max_attempts() =>
+            {
+                source
+                    .refresh_if_stale(source_snapshot.generation, engine, config, state, control)
+                    .await?;
+            }
             Err(err) if err.is_retryable() && attempt < retry.max_attempts() => {
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(retry.backoff_max);
@@ -795,7 +937,11 @@ async fn fetch_chunk_with_retry(
     )))
 }
 
-async fn probe_once(engine: &DownloadEngine, url: &str, state: &SharedState) -> Result<RemoteInfo> {
+async fn probe_once(
+    engine: &DownloadEngine,
+    url: &str,
+    state: &SharedState,
+) -> Result<ProbeResult> {
     let _permit = engine.limiter.acquire().await;
     let _active_io = ActiveIoGuard::new(state.clone());
     let response = engine
@@ -807,6 +953,7 @@ async fn probe_once(engine: &DownloadEngine, url: &str, state: &SharedState) -> 
         .await
         .map_err(map_reqwest_error)?;
 
+    let effective_url = response.url().clone();
     if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
         let total = response
             .headers()
@@ -820,10 +967,13 @@ async fn probe_once(engine: &DownloadEngine, url: &str, state: &SharedState) -> 
             })
             .and_then(parse_unsatisfied_total)?;
         if total == 0 {
-            return Ok(RemoteInfo {
-                content_len: 0,
-                etag: header_to_string(response.headers(), ETAG)?,
-                last_modified: header_to_string(response.headers(), LAST_MODIFIED)?,
+            return Ok(ProbeResult {
+                remote: RemoteInfo {
+                    content_len: 0,
+                    etag: header_to_string(response.headers(), ETAG)?,
+                    last_modified: header_to_string(response.headers(), LAST_MODIFIED)?,
+                },
+                effective_url,
             });
         }
         return Err(TakanawaError::HttpProtocol(format!(
@@ -849,16 +999,19 @@ async fn probe_once(engine: &DownloadEngine, url: &str, state: &SharedState) -> 
         )));
     }
 
-    Ok(RemoteInfo {
-        content_len: range.total,
-        etag: header_to_string(&headers, ETAG)?,
-        last_modified: header_to_string(&headers, LAST_MODIFIED)?,
+    Ok(ProbeResult {
+        remote: RemoteInfo {
+            content_len: range.total,
+            etag: header_to_string(&headers, ETAG)?,
+            last_modified: header_to_string(&headers, LAST_MODIFIED)?,
+        },
+        effective_url,
     })
 }
 
 async fn fetch_chunk_once(
     engine: &DownloadEngine,
-    url: &str,
+    url: &Url,
     chunk: Chunk,
     state: &SharedState,
     control: &Control,
@@ -869,7 +1022,7 @@ async fn fetch_chunk_once(
     let _active_io = ActiveIoGuard::new(state.clone());
     let response = engine
         .client
-        .get(url)
+        .get(url.clone())
         .header(RANGE, format!("bytes={}-{}", chunk.start, chunk.end))
         .header(ACCEPT_ENCODING, "identity")
         .send()
@@ -1139,6 +1292,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
 
@@ -1225,6 +1379,72 @@ mod tests {
 
         assert_eq!(snapshot.phase, DownloadPhase::Completed);
         assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+    }
+
+    #[tokio::test]
+    async fn caches_effective_url_after_probe_redirect() {
+        let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
+        let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::Stable);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target.clone(), 5, 4, 0);
+
+        let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+        assert_eq!(server.resolver_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshes_expired_effective_url_once_for_concurrent_chunks() {
+        let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
+        let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::ExpireThenRefresh);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target.clone(), 5, 4, 1);
+
+        let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+        assert_eq!(server.resolver_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_changed_resource_during_effective_url_refresh() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::RefreshChangesLength);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.original_url(), target, 5, 1, 1);
+
+        let err = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TakanawaError::RemoteChanged(_)));
+        assert_eq!(server.resolver_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_refresh_direct_url_after_forbidden_chunk() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let server = spawn_redirect_server(Arc::clone(&data), RedirectMode::Stable);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.direct_url(), target, 5, 1, 1);
+
+        let err = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TakanawaError::HttpStatus(403)));
+        assert_eq!(server.resolver_requests(), 0);
     }
 
     #[test]
@@ -1513,6 +1733,164 @@ mod tests {
 
     fn spawn_range_server(data: Arc<Vec<u8>>, ignore_range: bool) -> SocketAddr {
         spawn_range_server_with_chunk_delay(data, ignore_range, None)
+    }
+
+    #[derive(Clone, Copy)]
+    enum RedirectMode {
+        Stable,
+        ExpireThenRefresh,
+        RefreshChangesLength,
+    }
+
+    struct RedirectServer {
+        addr: SocketAddr,
+        resolver_requests: Arc<AtomicUsize>,
+    }
+
+    impl RedirectServer {
+        fn original_url(&self) -> String {
+            format!("http://{}/original", self.addr)
+        }
+
+        fn direct_url(&self) -> String {
+            format!("http://{}/direct", self.addr)
+        }
+
+        fn resolver_requests(&self) -> usize {
+            self.resolver_requests.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    fn test_download_config(
+        url: String,
+        target_path: PathBuf,
+        chunk_size: u64,
+        parallelism: usize,
+        max_retries: u32,
+    ) -> DownloadConfig {
+        DownloadConfig {
+            url,
+            target_path,
+            chunk_size,
+            parallelism,
+            max_parallel_chunks: 0,
+            retry: RetryConfig {
+                max_retries,
+                backoff_initial: Duration::from_millis(1),
+                backoff_max: Duration::from_millis(1),
+            },
+            timeout: TimeoutConfig::default(),
+            bytes_per_second_limit: 0,
+            hash: HashConfig::None,
+        }
+    }
+
+    fn spawn_redirect_server(data: Arc<Vec<u8>>, mode: RedirectMode) -> RedirectServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resolver_requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&resolver_requests);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let data = Arc::clone(&data);
+                let resolver_requests = Arc::clone(&server_requests);
+                thread::spawn(move || {
+                    handle_redirect_connection(stream, addr, &data, mode, &resolver_requests);
+                });
+            }
+        });
+        RedirectServer {
+            addr,
+            resolver_requests,
+        }
+    }
+
+    fn handle_redirect_connection(
+        mut stream: std::net::TcpStream,
+        addr: SocketAddr,
+        data: &[u8],
+        mode: RedirectMode,
+        resolver_requests: &AtomicUsize,
+    ) {
+        let mut buffer = [0; 4096];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let range = request_range(&request);
+
+        if path == "/original" {
+            let request_number = resolver_requests.fetch_add(1, AtomicOrdering::SeqCst);
+            let generation =
+                usize::from(!matches!(mode, RedirectMode::Stable) && request_number != 0);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/effective/{generation}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            return;
+        }
+
+        let Some((start, end)) = range else {
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            return;
+        };
+
+        if path == "/direct" && !(start == 0 && end == 0) {
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            return;
+        }
+
+        if path == "/effective/0"
+            && !matches!(mode, RedirectMode::Stable)
+            && !(start == 0 && end == 0)
+        {
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            return;
+        }
+
+        let changed_data;
+        let response_data =
+            if path == "/effective/1" && matches!(mode, RedirectMode::RefreshChangesLength) {
+                changed_data = [data, b"x"].concat();
+                changed_data.as_slice()
+            } else {
+                data
+            };
+        write_range_response(&mut stream, response_data, start, end);
+    }
+
+    fn write_range_response(
+        stream: &mut std::net::TcpStream,
+        data: &[u8],
+        start: usize,
+        end: usize,
+    ) {
+        let Some(body) = range_body(data, start, end, stream) else {
+            return;
+        };
+        let response = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+            start + body.len() - 1,
+            data.len(),
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
     }
 
     fn spawn_delayed_chunk_server(data: Arc<Vec<u8>>, delay: Duration) -> SocketAddr {
