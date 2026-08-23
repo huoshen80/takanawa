@@ -17,7 +17,7 @@ use takanawa_core::{
     TakanawaError,
 };
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::content_range::{parse_content_range, parse_unsatisfied_total};
@@ -270,6 +270,40 @@ pub struct DownloadHandle {
 struct Control {
     pause: AtomicBool,
     cancel: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlRequest {
+    Pause,
+    Cancel,
+}
+
+impl Control {
+    fn requested(&self) -> Option<ControlRequest> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Some(ControlRequest::Cancel);
+        }
+        self.pause
+            .load(Ordering::Relaxed)
+            .then_some(ControlRequest::Pause)
+    }
+
+    async fn wait_for_request(&self) -> ControlRequest {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(request) = self.requested() {
+                return request;
+            }
+            notified.await;
+        }
+    }
+
+    fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
 }
 
 impl DownloadHandle {
@@ -337,6 +371,7 @@ impl DownloadHandle {
     pub fn pause(&self) -> Result<()> {
         self.control.pause.store(true, Ordering::Relaxed);
         self.state.request_pause();
+        self.control.notify_waiters();
         Ok(())
     }
 
@@ -353,6 +388,7 @@ impl DownloadHandle {
     pub fn cancel(&self) -> Result<()> {
         self.control.cancel.store(true, Ordering::Relaxed);
         self.state.request_cancel();
+        self.control.notify_waiters();
         if self
             .join
             .lock()
@@ -415,6 +451,7 @@ impl DownloadHandle {
 impl Drop for DownloadHandle {
     fn drop(&mut self) {
         self.control.cancel.store(true, Ordering::Relaxed);
+        self.control.notify_waiters();
         if let Some(join) = self
             .join
             .lock()
@@ -462,7 +499,10 @@ async fn run_download(
     if complete_startup_control_request(&state, &control)? {
         return Ok(());
     }
-    let probe = probe_with_retry(&engine, &config, &state, &control).await?;
+    let Some(probe) = probe_with_retry(&engine, &config, &state, &control).await? else {
+        state.mark_paused();
+        return Ok(());
+    };
     if complete_startup_control_request(&state, &control)? {
         return Ok(());
     }
@@ -562,7 +602,12 @@ async fn run_download(
             break;
         }
 
-        let Some(result) = tasks.join_next().await else {
+        let result = tokio::select! {
+            biased;
+            _ = control.wait_for_request() => continue,
+            result = tasks.join_next() => result,
+        };
+        let Some(result) = result else {
             break;
         };
         let task_result = match result {
@@ -620,6 +665,26 @@ fn complete_startup_control_request(state: &SharedState, control: &Control) -> R
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn wait_for_retry_delay(delay: Duration, control: &Control) -> Option<ControlRequest> {
+    if let Some(request) = control.requested() {
+        return Some(request);
+    }
+    if delay.is_zero() {
+        return None;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(delay) => None,
+        request = control.wait_for_request() => Some(request),
+    }
+}
+
+fn interrupted<T>(request: ControlRequest) -> Result<Option<T>> {
+    match request {
+        ControlRequest::Pause => Ok(None),
+        ControlRequest::Cancel => Err(TakanawaError::Cancelled),
+    }
 }
 
 enum ChunkTaskResult {
@@ -696,27 +761,34 @@ impl AdaptiveConcurrency {
         self.current.load(Ordering::Relaxed)
     }
 
-    async fn acquire(&self) -> AdaptivePermit {
+    async fn acquire(&self, control: &Control) -> Result<Option<AdaptivePermit>> {
         loop {
-            self.wait_until_ready().await;
-            let permit = self.limiter.acquire().await;
+            if let Some(request) = self.wait_until_ready(control).await {
+                return interrupted(request);
+            }
+            let permit = tokio::select! {
+                permit = self.limiter.acquire() => permit,
+                request = control.wait_for_request() => return interrupted(request),
+            };
             if self.remaining_wait(Instant::now()).is_zero() {
-                return AdaptivePermit {
+                return Ok(Some(AdaptivePermit {
                     started_at: Instant::now(),
                     _permit: permit,
-                };
+                }));
             }
             drop(permit);
         }
     }
 
-    async fn wait_until_ready(&self) {
+    async fn wait_until_ready(&self, control: &Control) -> Option<ControlRequest> {
         loop {
             let delay = self.remaining_wait(Instant::now());
             if delay.is_zero() {
-                return;
+                return None;
             }
-            tokio::time::sleep(delay).await;
+            if let Some(request) = wait_for_retry_delay(delay, control).await {
+                return Some(request);
+            }
         }
     }
 
@@ -822,20 +894,22 @@ impl DownloadSource {
         config: &DownloadConfig,
         state: &SharedState,
         control: &Control,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _refresh = self.refresh.lock().await;
         if self.snapshot_without_refresh_lock().generation != observed_generation {
-            return Ok(());
+            return Ok(true);
         }
 
-        let refreshed = probe_with_retry(engine, config, state, control).await?;
+        let Some(refreshed) = probe_with_retry(engine, config, state, control).await? else {
+            return Ok(false);
+        };
         ensure_same_remote(&self.initial_remote, &refreshed.remote)?;
 
         let mut source = self.state.lock().expect("download source mutex poisoned");
         source.redirected = self.original_url != refreshed.effective_url;
         source.url = refreshed.effective_url;
         source.generation = source.generation.saturating_add(1);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -964,18 +1038,25 @@ async fn probe_with_retry(
     config: &DownloadConfig,
     state: &SharedState,
     control: &Control,
-) -> Result<ProbeResult> {
+) -> Result<Option<ProbeResult>> {
     let retry = config.retry.normalized();
     let mut delay = retry.backoff_initial;
     for attempt in 1..=retry.max_attempts() {
         if control.cancel.load(Ordering::Relaxed) {
             return Err(TakanawaError::Cancelled);
         }
+        if control.pause.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         match with_total_timeout(config.timeout.total, probe_once(engine, &config.url, state)).await
         {
-            Ok(remote) => return Ok(remote),
+            Ok(remote) => return Ok(Some(remote)),
             Err(err) if err.error.is_retryable() && attempt < retry.max_attempts() => {
-                tokio::time::sleep(retry_delay(delay, err.retry_after)).await;
+                if let Some(request) =
+                    wait_for_retry_delay(retry_delay(delay, err.retry_after), control).await
+                {
+                    return interrupted(request);
+                }
                 delay = (delay * 2).min(retry.backoff_max);
             }
             Err(err) => return Err(err.error),
@@ -1009,14 +1090,16 @@ async fn fetch_chunk_with_retry(
         if control.pause.load(Ordering::Relaxed) {
             return Ok(ChunkTaskResult::Paused);
         }
-        let attempt_permit = concurrency.acquire().await;
+        let Some(attempt_permit) = concurrency.acquire(control).await? else {
+            return Ok(ChunkTaskResult::Paused);
+        };
         let attempt_started_at = attempt_permit.started_at;
         let source_snapshot = source.snapshot().await;
         let attempt_result = with_total_timeout(
             config.timeout.total,
             fetch_chunk_once(
                 engine,
-                &source_snapshot.url,
+                source_snapshot.url,
                 chunk,
                 state,
                 control,
@@ -1044,9 +1127,12 @@ async fn fetch_chunk_with_retry(
                     && attempt < retry.max_attempts() =>
             {
                 drop(attempt_permit);
-                source
+                let refreshed = source
                     .refresh_if_stale(source_snapshot.generation, engine, config, state, control)
                     .await?;
+                if !refreshed {
+                    return Ok(ChunkTaskResult::Paused);
+                }
             }
             Err(err) if err.error.is_retryable() && attempt < retry.max_attempts() => {
                 let retry_delay = retry_delay(delay, err.retry_after);
@@ -1054,7 +1140,12 @@ async fn fetch_chunk_with_retry(
                     concurrency.report_rate_limit(attempt_started_at, retry_delay);
                 }
                 drop(attempt_permit);
-                tokio::time::sleep(retry_delay).await;
+                if let Some(request) = wait_for_retry_delay(retry_delay, control).await {
+                    return match request {
+                        ControlRequest::Pause => Ok(ChunkTaskResult::Paused),
+                        ControlRequest::Cancel => Err(TakanawaError::Cancelled),
+                    };
+                }
                 delay = (delay * 2).min(retry.backoff_max);
             }
             Err(err) => return Err(err.error),
@@ -1143,7 +1234,7 @@ async fn probe_once(
 
 async fn fetch_chunk_once(
     engine: &DownloadEngine,
-    url: &Url,
+    url: Url,
     chunk: Chunk,
     state: &SharedState,
     control: &Control,
@@ -1154,7 +1245,7 @@ async fn fetch_chunk_once(
     let _active_io = ActiveIoGuard::new(state.clone());
     let response = engine
         .client
-        .get(url.clone())
+        .get(url)
         .header(RANGE, format!("bytes={}-{}", chunk.start, chunk.end))
         .header(ACCEPT_ENCODING, "identity")
         .send()
@@ -1338,10 +1429,17 @@ fn validate_response_status(
     response: &reqwest::Response,
     now: SystemTime,
 ) -> HttpAttemptResult<()> {
-    let retry_after = (response.status() == StatusCode::TOO_MANY_REQUESTS)
+    let retry_after = uses_retry_after(response.status())
         .then(|| parse_retry_after(response.headers(), now))
         .flatten();
     validate_status(response.status()).map_err(|error| HttpAttemptError { error, retry_after })
+}
+
+fn uses_retry_after(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+    )
 }
 
 fn parse_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
@@ -1506,6 +1604,9 @@ mod tests {
         assert!(!is_rate_limit_error(&TakanawaError::Network(
             "reset".to_owned()
         )));
+        assert!(uses_retry_after(StatusCode::TOO_MANY_REQUESTS));
+        assert!(uses_retry_after(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!uses_retry_after(StatusCode::BAD_GATEWAY));
     }
 
     #[test]
@@ -1544,9 +1645,10 @@ mod tests {
     #[tokio::test]
     async fn reduced_limit_does_not_cancel_existing_attempts() {
         let concurrency = Arc::new(AdaptiveConcurrency::new(8));
+        let control = Control::default();
         let mut permits = Vec::new();
         for _ in 0..8 {
-            permits.push(concurrency.acquire().await);
+            permits.push(concurrency.acquire(&control).await.unwrap().unwrap());
         }
         let started_at = permits[0].started_at;
         concurrency.report_rate_limit(started_at, Duration::ZERO);
@@ -1557,27 +1659,27 @@ mod tests {
         assert_eq!(concurrency.limiter.in_flight(), 4);
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), concurrency.acquire())
+            tokio::time::timeout(Duration::from_millis(20), concurrency.acquire(&control))
                 .await
                 .is_err()
         );
         permits.pop();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), concurrency.acquire())
-                .await
-                .is_ok()
-        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), concurrency.acquire(&control)).await,
+            Ok(Ok(Some(_)))
+        ));
     }
 
     #[tokio::test]
     async fn rate_limit_blocks_new_attempts_until_shared_deadline() {
         let concurrency = AdaptiveConcurrency::new(2);
-        let permit = concurrency.acquire().await;
+        let control = Control::default();
+        let permit = concurrency.acquire(&control).await.unwrap().unwrap();
         concurrency.report_rate_limit(permit.started_at, Duration::from_millis(40));
         drop(permit);
 
         let started = Instant::now();
-        let _permit = concurrency.acquire().await;
+        let _permit = concurrency.acquire(&control).await.unwrap().unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(30));
     }
@@ -1724,7 +1826,7 @@ mod tests {
     #[tokio::test]
     async fn adapts_concurrency_until_rate_limited_download_recovers() {
         let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
-        let server = spawn_retry_status_server(Arc::clone(&data), 429, 12);
+        let server = spawn_retry_status_server(Arc::clone(&data), 429, 12, 0);
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("out.bin");
         let config = test_download_config(server.url(), target.clone(), 5, 8, 8);
@@ -1741,7 +1843,7 @@ mod tests {
     #[tokio::test]
     async fn persistent_rate_limit_exhausts_existing_retry_budget() {
         let data = Arc::new(b"abcdefghij".to_vec());
-        let server = spawn_retry_status_server(Arc::clone(&data), 429, usize::MAX);
+        let server = spawn_retry_status_server(Arc::clone(&data), 429, usize::MAX, 0);
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("out.bin");
         let config = test_download_config(server.url(), target, 5, 8, 2);
@@ -1751,6 +1853,50 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, TakanawaError::RetryableHttpStatus(429)));
+    }
+
+    #[test]
+    fn pause_interrupts_long_retry_after_wait() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let server = spawn_retry_status_server(Arc::clone(&data), 429, usize::MAX, 60);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let runtime = Runtime::new().unwrap();
+        let download = DownloadHandle::new(
+            DownloadEngine::new(DEFAULT_MAX_IO).unwrap(),
+            test_download_config(server.url(), target, 5, 2, 4),
+        );
+
+        download.start_on(&runtime).unwrap();
+        wait_for_failed_requests(&server, 1);
+        let started = Instant::now();
+        download.pause().unwrap();
+        let snapshot = wait_for_phase_and_idle(&download, DownloadPhase::Paused);
+
+        assert_eq!(snapshot.phase, DownloadPhase::Paused);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancel_interrupts_long_retry_after_wait() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let server = spawn_retry_status_server(Arc::clone(&data), 429, usize::MAX, 60);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let runtime = Runtime::new().unwrap();
+        let download = DownloadHandle::new(
+            DownloadEngine::new(DEFAULT_MAX_IO).unwrap(),
+            test_download_config(server.url(), target, 5, 2, 4),
+        );
+
+        download.start_on(&runtime).unwrap();
+        wait_for_failed_requests(&server, 1);
+        let started = Instant::now();
+        download.cancel().unwrap();
+        let snapshot = wait_for_phase_and_idle(&download, DownloadPhase::Cancelled);
+
+        assert_eq!(snapshot.phase, DownloadPhase::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -2130,6 +2276,7 @@ mod tests {
         data: Arc<Vec<u8>>,
         status: u16,
         failures: usize,
+        retry_after_seconds: u64,
     ) -> RetryStatusServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2145,6 +2292,7 @@ mod tests {
                         &data,
                         status,
                         failures,
+                        retry_after_seconds,
                         &failed_requests,
                     );
                 });
@@ -2161,6 +2309,7 @@ mod tests {
         data: &[u8],
         status: u16,
         failures: usize,
+        retry_after_seconds: u64,
         failed_requests: &AtomicUsize,
     ) {
         let Some((start, end)) = read_request_range(&mut stream) else {
@@ -2182,13 +2331,23 @@ mod tests {
                     "Service Unavailable"
                 };
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} {reason}\r\nRetry-After: {retry_after_seconds}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 );
                 stream.write_all(response.as_bytes()).unwrap();
                 return;
             }
         }
         write_range_response(&mut stream, data, start, end);
+    }
+
+    fn wait_for_failed_requests(server: &RetryStatusServer, minimum: usize) {
+        for _ in 0..100 {
+            if server.failed_requests() >= minimum {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("server did not observe {minimum} failed requests");
     }
 
     fn handle_redirect_connection(
