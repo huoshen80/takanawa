@@ -19,6 +19,7 @@ tls-platform-roots = ["tls-platform-native"]
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
+httpdate.workspace = true
 reqwest.workspace = true
 rustls = { workspace = true, optional = true }
 takanawa-core.workspace = true

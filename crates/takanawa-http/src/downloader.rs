@@ -1,15 +1,15 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{
     ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap,
-    LAST_MODIFIED, RANGE,
+    LAST_MODIFIED, RANGE, RETRY_AFTER,
 };
 use reqwest::{Client, StatusCode, Url};
 use takanawa_core::{
@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::content_range::{parse_content_range, parse_unsatisfied_total};
-use crate::limiter::IoLimiter;
+use crate::limiter::{IoLimiter, IoPermit};
 use crate::state::{
     DownloadSnapshot, DownloadSpeedSnapshot, ProgressCallback, SharedState, SpeedCallback,
 };
@@ -30,6 +30,7 @@ const DEFAULT_MAX_RETRIES: u32 = 4;
 const DEFAULT_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(3);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const WRITE_QUEUE_DEPTH_PER_CHUNK: usize = 8;
 
 /// Configuration for a resumable HTTP range download.
@@ -41,9 +42,9 @@ pub struct DownloadConfig {
     pub target_path: PathBuf,
     /// Requested chunk size in bytes. `0` selects the default chunk size.
     pub chunk_size: u64,
-    /// Requested chunk parallelism. `0` lets the engine choose a default.
+    /// Initial and maximum chunk parallelism. `0` lets the engine choose a default.
     pub parallelism: usize,
-    /// Maximum chunks to download at the same time. `0` falls back to `parallelism`.
+    /// Initial maximum chunks to download at the same time. `0` falls back to `parallelism`.
     pub max_parallel_chunks: usize,
     /// Retry policy for probe and chunk requests.
     pub retry: RetryConfig,
@@ -501,6 +502,7 @@ async fn run_download(
     } else {
         requested_parallelism.max(1)
     };
+    let concurrency = Arc::new(AdaptiveConcurrency::new(parallelism));
     let writer_capacity = parallelism
         .max(1)
         .saturating_mul(WRITE_QUEUE_DEPTH_PER_CHUNK);
@@ -523,7 +525,7 @@ async fn run_download(
 
         while !control.pause.load(Ordering::Relaxed)
             && !control.cancel.load(Ordering::Relaxed)
-            && tasks.len() < parallelism
+            && tasks.len() < concurrency.current()
         {
             let Some(index) = pending.pop_front() else {
                 break;
@@ -535,6 +537,7 @@ async fn run_download(
             let control = Arc::clone(&control);
             let bandwidth = Arc::clone(&bandwidth);
             let source = Arc::clone(&source);
+            let concurrency = Arc::clone(&concurrency);
             let writer_tx = writer_tx.clone();
             tasks.spawn(async move {
                 let result = fetch_chunk_with_retry(
@@ -545,6 +548,7 @@ async fn run_download(
                         control: &control,
                         bandwidth: &bandwidth,
                         source: &source,
+                        concurrency: &concurrency,
                         writer_tx: &writer_tx,
                     },
                     chunk,
@@ -635,7 +639,122 @@ struct ChunkFetchContext<'a> {
     control: &'a Control,
     bandwidth: &'a BandwidthLimiter,
     source: &'a DownloadSource,
+    concurrency: &'a AdaptiveConcurrency,
     writer_tx: &'a mpsc::Sender<WriterCommand>,
+}
+
+#[derive(Debug)]
+struct HttpAttemptError {
+    error: TakanawaError,
+    retry_after: Option<Duration>,
+}
+
+impl From<TakanawaError> for HttpAttemptError {
+    fn from(error: TakanawaError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+type HttpAttemptResult<T> = std::result::Result<T, HttpAttemptError>;
+
+#[derive(Debug)]
+struct AdaptiveConcurrency {
+    current: AtomicUsize,
+    limiter: IoLimiter,
+    timing: Mutex<AdaptiveTiming>,
+}
+
+#[derive(Debug)]
+struct AdaptiveTiming {
+    last_decrease: Option<Instant>,
+    retry_not_before: Instant,
+}
+
+#[derive(Debug)]
+struct AdaptivePermit {
+    started_at: Instant,
+    _permit: IoPermit,
+}
+
+impl AdaptiveConcurrency {
+    fn new(initial: usize) -> Self {
+        let initial = initial.max(1);
+        Self {
+            current: AtomicUsize::new(initial),
+            limiter: IoLimiter::new(initial),
+            timing: Mutex::new(AdaptiveTiming {
+                last_decrease: None,
+                retry_not_before: Instant::now(),
+            }),
+        }
+    }
+
+    fn current(&self) -> usize {
+        self.current.load(Ordering::Relaxed)
+    }
+
+    async fn acquire(&self) -> AdaptivePermit {
+        loop {
+            self.wait_until_ready().await;
+            let permit = self.limiter.acquire().await;
+            if self.remaining_wait(Instant::now()).is_zero() {
+                return AdaptivePermit {
+                    started_at: Instant::now(),
+                    _permit: permit,
+                };
+            }
+            drop(permit);
+        }
+    }
+
+    async fn wait_until_ready(&self) {
+        loop {
+            let delay = self.remaining_wait(Instant::now());
+            if delay.is_zero() {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn remaining_wait(&self, now: Instant) -> Duration {
+        self.timing
+            .lock()
+            .expect("adaptive concurrency mutex poisoned")
+            .retry_not_before
+            .saturating_duration_since(now)
+    }
+
+    fn report_rate_limit(&self, attempt_started_at: Instant, delay: Duration) {
+        self.report_rate_limit_at(attempt_started_at, delay, Instant::now());
+    }
+
+    fn report_rate_limit_at(&self, attempt_started_at: Instant, delay: Duration, now: Instant) {
+        let mut timing = self
+            .timing
+            .lock()
+            .expect("adaptive concurrency mutex poisoned");
+        timing.retry_not_before = timing.retry_not_before.max(now + delay);
+
+        if timing
+            .last_decrease
+            .is_some_and(|last_decrease| attempt_started_at <= last_decrease)
+        {
+            return;
+        }
+
+        let current = self.current();
+        if current <= 1 {
+            return;
+        }
+        let next = current.div_ceil(2).max(1);
+        self.current.store(next, Ordering::Relaxed);
+        self.limiter.set_max(next);
+        timing.last_decrease = Some(now);
+    }
 }
 
 #[derive(Debug)]
@@ -855,11 +974,11 @@ async fn probe_with_retry(
         match with_total_timeout(config.timeout.total, probe_once(engine, &config.url, state)).await
         {
             Ok(remote) => return Ok(remote),
-            Err(err) if err.is_retryable() && attempt < retry.max_attempts() => {
-                tokio::time::sleep(delay).await;
+            Err(err) if err.error.is_retryable() && attempt < retry.max_attempts() => {
+                tokio::time::sleep(retry_delay(delay, err.retry_after)).await;
                 delay = (delay * 2).min(retry.backoff_max);
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.error),
         }
     }
     Err(TakanawaError::Network(
@@ -878,6 +997,7 @@ async fn fetch_chunk_with_retry(
         control,
         bandwidth,
         source,
+        concurrency,
         writer_tx,
     } = context;
     let retry = config.retry.normalized();
@@ -889,8 +1009,10 @@ async fn fetch_chunk_with_retry(
         if control.pause.load(Ordering::Relaxed) {
             return Ok(ChunkTaskResult::Paused);
         }
+        let attempt_permit = concurrency.acquire().await;
+        let attempt_started_at = attempt_permit.started_at;
         let source_snapshot = source.snapshot().await;
-        match with_total_timeout(
+        let attempt_result = with_total_timeout(
             config.timeout.total,
             fetch_chunk_once(
                 engine,
@@ -902,9 +1024,10 @@ async fn fetch_chunk_with_retry(
                 writer_tx,
             ),
         )
-        .await
-        {
+        .await;
+        match attempt_result {
             Ok(FetchChunkStatus::Complete) => {
+                drop(attempt_permit);
                 if control.cancel.load(Ordering::Relaxed) {
                     return Err(TakanawaError::Cancelled);
                 }
@@ -916,19 +1039,25 @@ async fn fetch_chunk_with_retry(
             }
             Ok(FetchChunkStatus::Paused) => return Ok(ChunkTaskResult::Paused),
             Err(err)
-                if matches!(err.http_status(), Some(401 | 403))
+                if matches!(err.error.http_status(), Some(401 | 403))
                     && source_snapshot.redirected
                     && attempt < retry.max_attempts() =>
             {
+                drop(attempt_permit);
                 source
                     .refresh_if_stale(source_snapshot.generation, engine, config, state, control)
                     .await?;
             }
-            Err(err) if err.is_retryable() && attempt < retry.max_attempts() => {
-                tokio::time::sleep(delay).await;
+            Err(err) if err.error.is_retryable() && attempt < retry.max_attempts() => {
+                let retry_delay = retry_delay(delay, err.retry_after);
+                if is_rate_limit_error(&err.error) {
+                    concurrency.report_rate_limit(attempt_started_at, retry_delay);
+                }
+                drop(attempt_permit);
+                tokio::time::sleep(retry_delay).await;
                 delay = (delay * 2).min(retry.backoff_max);
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.error),
         }
     }
     Err(TakanawaError::Network(format!(
@@ -941,7 +1070,7 @@ async fn probe_once(
     engine: &DownloadEngine,
     url: &str,
     state: &SharedState,
-) -> Result<ProbeResult> {
+) -> HttpAttemptResult<ProbeResult> {
     let _permit = engine.limiter.acquire().await;
     let _active_io = ActiveIoGuard::new(state.clone());
     let response = engine
@@ -978,17 +1107,19 @@ async fn probe_once(
         }
         return Err(TakanawaError::HttpProtocol(format!(
             "probe range was unsatisfied for non-empty resource length {total}"
-        )));
+        ))
+        .into());
     }
 
-    validate_status(response.status())?;
+    validate_response_status(&response, SystemTime::now())?;
     validate_identity(response.headers())?;
     let range = response_content_range(&response, 0, 0)?;
     let content_len = response_content_length(&response)?;
     if content_len != 1 {
         return Err(TakanawaError::HttpProtocol(format!(
             "probe Content-Length mismatch: expected 1, got {content_len}"
-        )));
+        ))
+        .into());
     }
     let headers = response.headers().clone();
     let body = response.bytes().await.map_err(map_reqwest_error)?;
@@ -996,7 +1127,8 @@ async fn probe_once(
         return Err(TakanawaError::HttpProtocol(format!(
             "probe body length mismatch: expected 1, got {}",
             body.len()
-        )));
+        ))
+        .into());
     }
 
     Ok(ProbeResult {
@@ -1017,7 +1149,7 @@ async fn fetch_chunk_once(
     control: &Control,
     bandwidth: &BandwidthLimiter,
     writer_tx: &mpsc::Sender<WriterCommand>,
-) -> Result<FetchChunkStatus> {
+) -> HttpAttemptResult<FetchChunkStatus> {
     let _permit = engine.limiter.acquire().await;
     let _active_io = ActiveIoGuard::new(state.clone());
     let response = engine
@@ -1029,7 +1161,7 @@ async fn fetch_chunk_once(
         .await
         .map_err(map_reqwest_error)?;
 
-    validate_status(response.status())?;
+    validate_response_status(&response, SystemTime::now())?;
     validate_identity(response.headers())?;
     let _range = response_content_range(&response, chunk.start, chunk.end)?;
     let content_len = response_content_length(&response)?;
@@ -1037,9 +1169,12 @@ async fn fetch_chunk_once(
         return Err(TakanawaError::HttpProtocol(format!(
             "chunk {} Content-Length mismatch: expected {}, got {content_len}",
             chunk.index, chunk.len
-        )));
+        ))
+        .into());
     }
-    stream_body_to_writer(response, chunk, state, control, bandwidth, writer_tx).await
+    stream_body_to_writer(response, chunk, state, control, bandwidth, writer_tx)
+        .await
+        .map_err(Into::into)
 }
 
 async fn stream_body_to_writer(
@@ -1128,13 +1263,16 @@ async fn commit_written_chunk(
 
 async fn with_total_timeout<T>(
     timeout: Duration,
-    future: impl Future<Output = Result<T>>,
-) -> Result<T> {
+    future: impl Future<Output = HttpAttemptResult<T>>,
+) -> HttpAttemptResult<T> {
     if timeout.is_zero() {
         return future.await;
     }
     tokio::time::timeout(timeout, future).await.map_err(|_| {
-        TakanawaError::Network(format!("request exceeded {} ms", timeout.as_millis()))
+        HttpAttemptError::from(TakanawaError::Network(format!(
+            "request exceeded {} ms",
+            timeout.as_millis()
+        )))
     })?
 }
 
@@ -1194,6 +1332,37 @@ fn validate_status(status: StatusCode) -> Result<()> {
         return Err(TakanawaError::RetryableHttpStatus(status.as_u16()));
     }
     Err(TakanawaError::HttpStatus(status.as_u16()))
+}
+
+fn validate_response_status(
+    response: &reqwest::Response,
+    now: SystemTime,
+) -> HttpAttemptResult<()> {
+    let retry_after = (response.status() == StatusCode::TOO_MANY_REQUESTS)
+        .then(|| parse_retry_after(response.headers(), now))
+        .flatten();
+    validate_status(response.status()).map_err(|error| HttpAttemptError { error, retry_after })
+}
+
+fn parse_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let delay = if let Ok(seconds) = value.parse::<u128>() {
+        Duration::from_secs(u64::try_from(seconds.min(u128::from(u64::MAX))).ok()?)
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    };
+    Some(delay.min(MAX_RETRY_AFTER))
+}
+
+fn retry_delay(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    retry_after.map_or(backoff, |retry_after| backoff.max(retry_after))
+}
+
+fn is_rate_limit_error(error: &TakanawaError) -> bool {
+    matches!(error, TakanawaError::RetryableHttpStatus(429))
 }
 
 fn validate_identity(headers: &HeaderMap) -> Result<()> {
@@ -1306,6 +1475,111 @@ mod tests {
         assert!(matches!(error, TakanawaError::HttpStatus(401)));
         assert_eq!(error.http_status(), Some(401));
         assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn parses_and_caps_retry_after_values() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers, now), Some(MAX_RETRY_AFTER));
+
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(30));
+        headers.insert(RETRY_AFTER, date.parse().unwrap());
+        assert_eq!(
+            parse_retry_after(&headers, now),
+            Some(Duration::from_secs(30))
+        );
+
+        headers.insert(RETRY_AFTER, "not-a-delay".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers, now), None);
+    }
+
+    #[test]
+    fn only_http_429_is_a_rate_limit_signal() {
+        assert!(is_rate_limit_error(&TakanawaError::RetryableHttpStatus(
+            429
+        )));
+        assert!(!is_rate_limit_error(&TakanawaError::RetryableHttpStatus(
+            503
+        )));
+        assert!(!is_rate_limit_error(&TakanawaError::Network(
+            "reset".to_owned()
+        )));
+    }
+
+    #[test]
+    fn rate_limit_reduces_once_per_in_flight_batch() {
+        let concurrency = AdaptiveConcurrency::new(8);
+        let first_batch = Instant::now();
+        let first_decrease = first_batch + Duration::from_millis(1);
+
+        concurrency.report_rate_limit_at(first_batch, Duration::ZERO, first_decrease);
+        assert_eq!(concurrency.current(), 4);
+
+        concurrency.report_rate_limit_at(
+            first_batch,
+            Duration::ZERO,
+            first_decrease + Duration::from_millis(1),
+        );
+        assert_eq!(concurrency.current(), 4);
+
+        let second_batch = first_decrease + Duration::from_millis(2);
+        concurrency.report_rate_limit_at(
+            second_batch,
+            Duration::ZERO,
+            second_batch + Duration::from_millis(1),
+        );
+        assert_eq!(concurrency.current(), 2);
+
+        let third_batch = second_batch + Duration::from_millis(2);
+        concurrency.report_rate_limit_at(
+            third_batch,
+            Duration::ZERO,
+            third_batch + Duration::from_millis(1),
+        );
+        assert_eq!(concurrency.current(), 1);
+    }
+
+    #[tokio::test]
+    async fn reduced_limit_does_not_cancel_existing_attempts() {
+        let concurrency = Arc::new(AdaptiveConcurrency::new(8));
+        let mut permits = Vec::new();
+        for _ in 0..8 {
+            permits.push(concurrency.acquire().await);
+        }
+        let started_at = permits[0].started_at;
+        concurrency.report_rate_limit(started_at, Duration::ZERO);
+
+        assert_eq!(concurrency.current(), 4);
+        assert_eq!(concurrency.limiter.in_flight(), 8);
+        permits.truncate(4);
+        assert_eq!(concurrency.limiter.in_flight(), 4);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), concurrency.acquire())
+                .await
+                .is_err()
+        );
+        permits.pop();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), concurrency.acquire())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_blocks_new_attempts_until_shared_deadline() {
+        let concurrency = AdaptiveConcurrency::new(2);
+        let permit = concurrency.acquire().await;
+        concurrency.report_rate_limit(permit.started_at, Duration::from_millis(40));
+        drop(permit);
+
+        let started = Instant::now();
+        let _permit = concurrency.acquire().await;
+
+        assert!(started.elapsed() >= Duration::from_millis(30));
     }
 
     #[test]
@@ -1445,6 +1719,38 @@ mod tests {
 
         assert!(matches!(err, TakanawaError::HttpStatus(403)));
         assert_eq!(server.resolver_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn adapts_concurrency_until_rate_limited_download_recovers() {
+        let data = Arc::new(b"abcdefghijklmnopqrstuvwxyz".to_vec());
+        let server = spawn_retry_status_server(Arc::clone(&data), 429, 12);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.url(), target.clone(), 5, 8, 8);
+
+        let snapshot = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.phase, DownloadPhase::Completed);
+        assert_eq!(std::fs::read(target).unwrap(), data.as_slice());
+        assert_eq!(server.failed_requests(), 12);
+    }
+
+    #[tokio::test]
+    async fn persistent_rate_limit_exhausts_existing_retry_budget() {
+        let data = Arc::new(b"abcdefghij".to_vec());
+        let server = spawn_retry_status_server(Arc::clone(&data), 429, usize::MAX);
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out.bin");
+        let config = test_download_config(server.url(), target, 5, 8, 2);
+
+        let err = download_to_completion(DownloadEngine::new(DEFAULT_MAX_IO).unwrap(), config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TakanawaError::RetryableHttpStatus(429)));
     }
 
     #[test]
@@ -1747,6 +2053,21 @@ mod tests {
         resolver_requests: Arc<AtomicUsize>,
     }
 
+    struct RetryStatusServer {
+        addr: SocketAddr,
+        failed_requests: Arc<AtomicUsize>,
+    }
+
+    impl RetryStatusServer {
+        fn url(&self) -> String {
+            format!("http://{}/file", self.addr)
+        }
+
+        fn failed_requests(&self) -> usize {
+            self.failed_requests.load(AtomicOrdering::SeqCst)
+        }
+    }
+
     impl RedirectServer {
         fn original_url(&self) -> String {
             format!("http://{}/original", self.addr)
@@ -1803,6 +2124,71 @@ mod tests {
             addr,
             resolver_requests,
         }
+    }
+
+    fn spawn_retry_status_server(
+        data: Arc<Vec<u8>>,
+        status: u16,
+        failures: usize,
+    ) -> RetryStatusServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let failed_requests = Arc::new(AtomicUsize::new(0));
+        let server_failures = Arc::clone(&failed_requests);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let data = Arc::clone(&data);
+                let failed_requests = Arc::clone(&server_failures);
+                thread::spawn(move || {
+                    handle_retry_status_connection(
+                        stream,
+                        &data,
+                        status,
+                        failures,
+                        &failed_requests,
+                    );
+                });
+            }
+        });
+        RetryStatusServer {
+            addr,
+            failed_requests,
+        }
+    }
+
+    fn handle_retry_status_connection(
+        mut stream: std::net::TcpStream,
+        data: &[u8],
+        status: u16,
+        failures: usize,
+        failed_requests: &AtomicUsize,
+    ) {
+        let Some((start, end)) = read_request_range(&mut stream) else {
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        };
+        if !(start == 0 && end == 0) {
+            let should_fail = failed_requests
+                .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |count| {
+                    (count < failures).then_some(count.saturating_add(1))
+                })
+                .is_ok();
+            if should_fail {
+                let reason = if status == 429 {
+                    "Too Many Requests"
+                } else {
+                    "Service Unavailable"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                return;
+            }
+        }
+        write_range_response(&mut stream, data, start, end);
     }
 
     fn handle_redirect_connection(

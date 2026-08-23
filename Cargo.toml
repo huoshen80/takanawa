@@ -30,6 +30,7 @@ fs2 = "0.4"
 futures-util = "0.3"
 godot = { version = "0.5.3", features = ["api-4-5"] }
 hex = "0.4"
+httpdate = "1.0.3"
 napi = { version = "3.9", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3.5.6"
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
